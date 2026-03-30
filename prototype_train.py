@@ -1,8 +1,10 @@
 import os
 import pandas as pd
+import numpy as np
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import RepeatedKFold, KFold, cross_val_score
-from sklearn.linear_model import Ridge
+from sklearn.linear_model import Ridge, Lasso, ElasticNet
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 
 SEED = 2003
 
@@ -83,7 +85,7 @@ def load_data(stock_number):
     return train_data, test_data
 
 #Train model
-def train(x_scaled, y_train, x_test_scaled, baseline_rmse, cv):
+def train_ridge(x_scaled, y_train, x_test_scaled, baseline_rmse, cv):
     best_rmse = baseline_rmse
     best_predictions = y_train.mean()
     best_alpha = None
@@ -105,12 +107,76 @@ def train(x_scaled, y_train, x_test_scaled, baseline_rmse, cv):
 
     return best_rmse, best_predictions, best_alpha
 
-def main():
-    train_data_1, test_data_1 = load_data(1)
-    explore_data(train_data_1, test_data_1)
-    x_train_1, y_train_1, x_test_1, baseline_rmse_1 = prepare_data(train_data_1, test_data_1)
-    cv = cross_validate(len(train_data_1))
-    best_rmse_1, best_predictions_1, best_alpha_1 = train(x_train_1, y_train_1, x_test_1, baseline_rmse_1, cv)
-    print(f"Best RMSE for Stock 1: {best_rmse_1:.4f} with alpha {best_alpha_1}, Test Prediction: {best_predictions_1:.4f}")
+def train_gradient_boost(x_scaled, y_train, x_test_scaled, baseline_rmse, cv, seed=SEED):
+    best_rmse = baseline_rmse
+    best_predictions = y_train.mean()
+    best_params = None
 
-main()
+    configs = [
+        {"n_estimators": 100, "max_depth": 3, "learning_rate": 0.1},
+        {"n_estimators": 200, "max_depth": 4, "learning_rate": 0.05},
+        {"n_estimators": 300, "max_depth": 5, "learning_rate": 0.05},
+    ]
+
+    for params in configs:
+        model = GradientBoostingRegressor(**params, random_state=seed)
+        scores = cross_val_score(model, x_scaled, y_train, cv=cv, scoring="neg_root_mean_squared_error")
+        rmse = -scores.mean()
+
+        model.fit(x_scaled, y_train)
+        predictions = model.predict(x_test_scaled)[0]
+
+        print(f"Config: {params}, CV RMSE: {rmse:.4f}, Test Prediction: {predictions:.4f}")
+
+        if rmse < best_rmse:
+            best_rmse = rmse
+            best_predictions = predictions
+            best_params = params
+
+    return best_rmse, best_predictions, best_params
+    
+def analyze_stock(stock_number):
+    train_data, test_data = load_data(stock_number)
+    explore_data(train_data, test_data)
+
+    x_train, y_train, x_test, baseline_rmse = prepare_data(train_data, test_data)
+    cv = cross_validate(len(y_train))
+
+    #Fit data on diffrent models 
+    ridge_rmse, ridge_prediction, ridge_alpha = train_ridge(x_train, y_train, x_test, baseline_rmse, cv)
+    gb_rmse, gb_prediction, gb_params = train_gradient_boost(x_train, y_train, x_test, baseline_rmse, cv)
+
+    if ridge_rmse <= gb_rmse:
+        best_rmse = ridge_rmse
+        best_prediction = ridge_prediction
+        best_model = f"Ridge(alpha={ridge_alpha})"
+    else:
+        best_rmse = gb_rmse
+        best_prediction = gb_prediction
+        best_model = f"GradientBoostingRegressor({gb_params})" 
+
+    return {
+        "stock_number": stock_number,
+        "best_rmse": best_rmse,
+        "baseline_rmse": baseline_rmse,
+        "best_prediction": best_prediction,
+        "best_model": best_model,
+    }
+
+def main():
+    results = []
+
+    for stock_number in range(1, 10):
+        print(f"\n--- Stock {stock_number} ---")
+        results.append(analyze_stock(stock_number))
+
+    print("\nSummary")
+    for result in results:
+        print(
+            f"Best RMSE for Stock {result['stock_number']}: "
+            f"{result['best_rmse']:.4f} with model {result['best_model']}, "
+            f"Test Prediction: {result['best_prediction']:.4f}"
+        )
+
+if __name__ == "__main__":
+    main()
