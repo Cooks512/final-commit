@@ -174,7 +174,7 @@ if __name__ == "__main__":
     from pathlib import Path
     import sys
     sys.path.append(str(Path(__file__).parent))
-    from data_check import profile_dataset
+    from pipeline.data_check import profile_dataset
     
     sys.stdout = open("output.log", "w")
 

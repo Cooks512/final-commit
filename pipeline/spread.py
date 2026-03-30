@@ -144,8 +144,8 @@ if __name__ == "__main__":
     import sys
     import pandas as pd
     sys.path.append(str(Path(__file__).parent))
-    from data_check import profile_dataset
-    from model_select import select_model
+    from pipeline.data_check import profile_dataset
+    from pipeline.model_select import select_model
 
     DATA_DIR = Path(__file__).parent.parent / "hackathon_data"
 
