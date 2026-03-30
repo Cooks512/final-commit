@@ -1,12 +1,13 @@
 import os
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import RepeatedKFold, KFold
+from sklearn.model_selection import RepeatedKFold, KFold, cross_val_score
+from sklearn.linear_model import Ridge
 
 SEED = 2003
 
 #Return cross-validation strategy based on the number of rows in the training data
-def cross_validate(n_rows, seed=SEED, heavy_but_betterSlighly=False):
+def cross_validate(n_rows, seed=SEED, heavy_but_better=False):
     
     if heavy_but_better:
         return RepeatedKFold(n_splits=5, n_repeats=10, random_state=seed)
@@ -17,7 +18,7 @@ def cross_validate(n_rows, seed=SEED, heavy_but_betterSlighly=False):
         return RepeatedKFold(n_splits=5, n_repeats=3, random_state=seed)
     else:
         return KFold(n_splits=5, shuffle=True, random_state=seed)
-    
+
 #Function to explore a given stock's training and testing data
 def explore_data(train_data, test_data):
     x_train = train_data.drop("target", axis=1)
@@ -82,10 +83,34 @@ def load_data(stock_number):
     return train_data, test_data
 
 #Train model
-def train():
-    pass
+def train(x_scaled, y_train, x_test_scaled, baseline_rmse, cv):
+    best_rmse = baseline_rmse
+    best_predictions = y_train.mean()
+    best_alpha = None
+
+    for alpha in [0.01, 0.1, 1.0, 10.0, 100.0]:
+        model = Ridge(alpha=alpha)
+        scores = cross_val_score(model, x_scaled, y_train, cv=cv, scoring="neg_root_mean_squared_error")
+        rmse = -scores.mean()
+
+        model.fit(x_scaled, y_train)
+        predictions = model.predict(x_test_scaled)[0]
+
+        print(f"Alpha: {alpha}, CV RMSE: {rmse:.4f}, Test Prediction: {predictions:.4f}")
+
+        if rmse < best_rmse:
+            best_rmse = rmse
+            best_predictions = predictions
+            best_alpha = alpha
+
+    return best_rmse, best_predictions, best_alpha
 
 def main():
     train_data_1, test_data_1 = load_data(1)
     explore_data(train_data_1, test_data_1)
     x_train_1, y_train_1, x_test_1, baseline_rmse_1 = prepare_data(train_data_1, test_data_1)
+    cv = cross_validate(len(train_data_1))
+    best_rmse_1, best_predictions_1, best_alpha_1 = train(x_train_1, y_train_1, x_test_1, baseline_rmse_1, cv)
+    print(f"Best RMSE for Stock 1: {best_rmse_1:.4f} with alpha {best_alpha_1}, Test Prediction: {best_predictions_1:.4f}")
+
+main()
