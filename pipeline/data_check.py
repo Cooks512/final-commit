@@ -69,7 +69,7 @@ def profile_dataset(train: pd.DataFrame, test: pd.DataFrame, target_col: str = "
     # Identify outliers using z-scores (threshold of 3)
     z_scores      = (y - y.mean()) / y.std()
     p.n_outliers  = int((z_scores.abs() > 3).sum())
-    p.outlier_pct = round(p.n_outliers / p.n_train * 100, 2)
+    p.outlier_pct = p.n_outliers / p.n_train * 100
     p.heavy_tails = p.outlier_pct > 2.0
 
     # Check if features are already scaled (rough heuristic based on mean and std)
@@ -79,13 +79,13 @@ def profile_dataset(train: pd.DataFrame, test: pd.DataFrame, target_col: str = "
 
     # Correlation analysis
     corrs = X.corrwith(y).abs().sort_values(ascending=False)
-    p.top_target_corr  = round(float(corrs.iloc[0]), 4)
-    p.mean_target_corr = round(float(corrs.mean()), 4)
+    p.top_target_corr  = float(corrs.iloc[0])
+    p.mean_target_corr = float(corrs.mean())
 
     # Feature collinearity check
     fc = X.corr().abs().values.copy()
     np.fill_diagonal(fc, 0)
-    p.max_feat_corr     = round(float(fc.max()), 4)
+    p.max_feat_corr     = float(fc.max())
     p.high_collinearity = p.max_feat_corr > 0.7
 
     # Determine signal strength based on top feature correlation with target
@@ -104,19 +104,19 @@ def profile_dataset(train: pd.DataFrame, test: pd.DataFrame, target_col: str = "
     # Compute distance from test points to nearest train points as a simple OOD signal
     dist_matrix    = cdist(test_scaled, X_scaled, metric="euclidean")
     min_dists      = dist_matrix.min(axis=1)           # nearest neighbour per test row
-    p.test_min_dist = round(float(min_dists.mean()), 4)
+    p.test_min_dist = float(min_dists.mean())
 
     # Also keep centroid distance as a secondary signal
     centroid       = X_scaled.mean(axis=0)
     centroid_dists = np.linalg.norm(test_scaled - centroid, axis=1)
-    p.test_dist_p10 = round(float(np.percentile(centroid_dists, 10)), 4)
+    p.test_dist_p10 = float(np.percentile(centroid_dists, 10))
 
     # Simple heuristic: if test points are on average more than ~4 units away from nearest train points in scaled space, flag as OOD
     p.test_ood = p.test_min_dist > 4.0
 
     # If test set is OOD, we can consider increasing model complexity (e.g. via regularisation parameters or tree depth) to try to capture more complex patterns — this multiplier can be used later in model selection
     if p.test_ood:
-        p.ood_spread_multiplier = round(min(p.test_min_dist / 2.5, 2.5), 2)
+        p.ood_spread_multiplier = min(p.test_min_dist / 2.5, 2.5)
 
     # Based on the profile, decide whether to try polynomial features and/or robust loss functions
     p.try_poly_features = (
