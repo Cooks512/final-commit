@@ -1,135 +1,296 @@
-import pandas as pd
-import numpy as np
-from sklearn.linear_model import RidgeCV, ElasticNetCV, BayesianRidge
-from sklearn.preprocessing import StandardScaler, PolynomialFeatures
-from sklearn.pipeline import Pipeline
-from sklearn.model_selection import KFold, cross_val_score
-import lightgbm as lgb
-from xgboost import XGBRegressor
 import warnings
+
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
+from xgboost import XGBRegressor
+from sklearn.base import clone
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.linear_model import BayesianRidge, ElasticNet, Lasso, LinearRegression, Ridge
+from sklearn.model_selection import GridSearchCV, KFold, cross_val_score
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import PolynomialFeatures, StandardScaler
+from sklearn.svm import SVR
+
 warnings.filterwarnings("ignore")
 
-#Build a set of candidate models based on the dataset profile
-def _build_candidates(profile):
+SCORING = "neg_root_mean_squared_error"
 
-    candidates = {
-        "Ridge": Pipeline([
-            ("scaler", StandardScaler()),
-            ("ridge", RidgeCV(alphas=[0.001, 0.01, 0.1, 1, 10, 100, 1000]))
-        ]),
 
-        "BayesianRidge": Pipeline([
-            ("scaler", StandardScaler()),
-            ("br", BayesianRidge())
-        ]),
+# Returns the best CV for given model and params.
+def _build_cv(n_rows, random_state):
+    if n_rows < 40:
+        n_splits = 3
+    elif n_rows < 120:
+        n_splits = 4
+    else:
+        n_splits = 5
 
-        "ElasticNet": Pipeline([
-            ("scaler", StandardScaler()),
-            ("en", ElasticNetCV(
-                l1_ratio=[0.1, 0.3, 0.5, 0.7, 0.9],
-                alphas=[0.001, 0.01, 0.1, 1, 10],
-                cv=3, random_state=42, max_iter=5000
-            ))
-        ]),
+    return KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+
+
+# Builds candidate models and their tuning spaces based on dataset profile
+def _build_candidate_spaces(profile):
+    candidate_spaces = {
+        "LinearRegression": {
+            "estimator": Pipeline([
+                ("scaler", StandardScaler()),
+                ("linear", LinearRegression())
+            ]),
+            "param_grid": {},
+        },
+        "Ridge": {
+            "estimator": Pipeline([
+                ("scaler", StandardScaler()),
+                ("ridge", Ridge())
+            ]),
+            "param_grid": {
+                "ridge__alpha": [0.001, 0.01, 0.1, 1, 10, 100, 1000],
+            },
+        },
+        "Lasso": {
+            "estimator": Pipeline([
+                ("scaler", StandardScaler()),
+                ("lasso", Lasso(max_iter=10000, random_state=42))
+            ]),
+            "param_grid": {
+                "lasso__alpha": [0.0001, 0.001, 0.01, 0.1, 1.0],
+            },
+        },
+        "BayesianRidge": {
+            "estimator": Pipeline([
+                ("scaler", StandardScaler()),
+                ("bayes", BayesianRidge())
+            ]),
+            "param_grid": {
+                "bayes__alpha_1": [1e-6, 1e-5],
+                "bayes__lambda_1": [1e-6, 1e-5],
+            },
+        },
+        "ElasticNet": {
+            "estimator": Pipeline([
+                ("scaler", StandardScaler()),
+                ("enet", ElasticNet(max_iter=10000, random_state=42))
+            ]),
+            "param_grid": {
+                "enet__alpha": [0.001, 0.01, 0.1, 1.0],
+                "enet__l1_ratio": [0.2, 0.5, 0.8],
+            },
+        },
     }
 
-    # Only include poly if profile says it's worth trying
+    # Add polynomial features if profile recommends
     if profile.try_poly_features:
-        candidates["Ridge+Poly"] = Pipeline([
-            ("poly",   PolynomialFeatures(degree=2, include_bias=False)),
-            ("scaler", StandardScaler()),
-            ("ridge",  RidgeCV(alphas=[0.01, 0.1, 1, 10, 100, 1000]))
-        ])
+        candidate_spaces["Ridge+Poly"] = {
+            "estimator": Pipeline([
+                ("poly", PolynomialFeatures(include_bias=False)),
+                ("scaler", StandardScaler()),
+                ("ridge", Ridge())
+            ]),
+            "param_grid": {
+                "poly__degree": [2, 3] if profile.n_train >= 150 else [2],
+                "ridge__alpha": [0.01, 0.1, 1, 10, 100],
+            },
+        }
 
-    # Only include tree models on larger datasets where they can generalise
+    # KNN — best chance on small datasets (stocks 3, 9) where nearest-neighbour
+    # can beat linear models. Gated to n_train <= 500 to avoid slow fits on large data.
+    # SVR — support vector regression, also gated to smaller datasets.
+    if profile.n_train <= 500:
+        candidate_spaces["KNN"] = {
+            "estimator": Pipeline([
+                ("scaler", StandardScaler()),
+                ("knn", KNeighborsRegressor())
+            ]),
+            "param_grid": {
+                "knn__n_neighbors": [3, 5, 7, 11],
+                "knn__weights": ["uniform", "distance"],
+            },
+        }
+
+        candidate_spaces["SVR"] = {
+            "estimator": Pipeline([
+                ("scaler", StandardScaler()),
+                ("svr", SVR())
+            ]),
+            "param_grid": {
+                "svr__kernel": ["rbf", "linear"],
+                "svr__C": [0.1, 1, 10],
+                "svr__epsilon": [0.01, 0.1, 0.5],
+            },
+        }
+
+    # Add tree-based models for larger datasets
     if profile.n_train >= 80:
+        # GradientBoosting — uses Huber loss when heavy_tails detected,
+        # which downweights outlier targets. Ties into use_robust_loss from data_check.
+        candidate_spaces["GradientBoosting"] = {
+            "estimator": GradientBoostingRegressor(
+                random_state=42,
+            ),
+            "param_grid": {
+                "n_estimators": [100, 200],
+                "learning_rate": [0.05, 0.1],
+                "max_depth": [2, 3, 4],
+                "loss": ["huber", "squared_error"] if profile.use_robust_loss else ["squared_error"],
+            },
+        }
 
-        candidates["LightGBM"] = lgb.LGBMRegressor(
-            n_estimators=200,       
-            num_leaves=15,         
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_alpha=0.5,          
-            reg_lambda=2.0,         
-            min_child_samples=max(5, profile.n_train // 20),
-            random_state=42,
-            verbose=-1
-        )
+        candidate_spaces["LightGBM"] = {
+            "estimator": lgb.LGBMRegressor(
+                random_state=42,
+                verbose=-1,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                n_jobs=1,
+            ),
+            "param_grid": {
+                "n_estimators": [100, 200],
+                "num_leaves": [15, 31],
+                "learning_rate": [0.05, 0.1],
+            },
+        }
 
-        candidates["XGBoost"] = XGBRegressor(
-            n_estimators=200,       
-            max_depth=3,            
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_alpha=0.5,
-            reg_lambda=2.0,
-            random_state=42,
-            verbosity=0
-        )
+        candidate_spaces["XGBoost"] = {
+            "estimator": XGBRegressor(
+                random_state=42,
+                verbosity=0,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                n_jobs=1,
+            ),
+            "param_grid": {
+                "n_estimators": [100, 200],
+                "max_depth": [3, 4],
+                "learning_rate": [0.05, 0.1],
+            },
+        }
 
-    return candidates
+    return candidate_spaces
 
-def select_model(profile, X_train, y_train, verbose=True):
 
-    candidates = _build_candidates(profile)
+# Tune parameters for a single candidate model
+def tune_candidate_model(name, estimator, param_grid, X_train, y_train, cv):
+    search = GridSearchCV(
+        estimator=estimator,
+        param_grid=param_grid,
+        scoring=SCORING,
+        cv=cv,
+        refit=True,
+        n_jobs=-1,
+    )
+    search.fit(X_train, y_train)
 
-    # CV setup
-    n_folds = min(5, max(3, profile.n_train // 10))
-    cv = KFold(n_splits=n_folds, shuffle=True, random_state=42)
+    best_index = search.best_index_
+    best_rmse = float(-search.best_score_)
+    best_std = float(search.cv_results_["std_test_score"][best_index])
 
-    # Run CV — collect per-fold predictions for potential blending
-    scores = {}
-    fold_preds = {}
+    return {
+        "name": name,
+        "best_estimator": search.best_estimator_,
+        "best_params": search.best_params_,
+        "tune_rmse": best_rmse,
+        "tune_std": best_std,
+    }
+
+
+# Tunes all candidate models for a stock
+def tune_all_candidates(profile, X_train, y_train, verbose=True):
+    candidate_spaces = _build_candidate_spaces(profile)
+    tuning_cv = _build_cv(profile.n_train, random_state=42)
+    tuned_candidates = {}
 
     if verbose:
-        print(f"\n  {'Model':<20} {'RMSE':>8}  {'±std':>6}")
-        print(f"  {'-'*38}")
+        print(f"\n  {'Model':<20} {'Tune RMSE':>10}  {'+/- std':>8}")
+        print(f"  {'-' * 44}")
 
-    for name, model in candidates.items():
-        cv_scores = cross_val_score(
-            model, X_train, y_train,
-            scoring="neg_root_mean_squared_error",
-            cv=cv
+    for name, config in candidate_spaces.items():
+        tuned = tune_candidate_model(
+            name,
+            config["estimator"],
+            config["param_grid"],
+            X_train,
+            y_train,
+            tuning_cv,
         )
-        rmse = float(-cv_scores.mean())
-        std  = float(cv_scores.std())
-        scores[name] = (rmse, std)
+        tuned_candidates[name] = tuned
 
         if verbose:
-            print(f"  {name:<20} {rmse:>8.3f}  {std:>6.3f}")
+            print(f"  {name:<20} {tuned['tune_rmse']:>10.3f}  {tuned['tune_std']:>8.3f}")
 
-    # Pick winner
-    best_name = min(scores, key=lambda k: scores[k][0])
-    best_rmse, best_std = scores[best_name]
+    return tuned_candidates
 
-    # --- NEW: simple blend of top-2 if they're close ---
-    sorted_models = sorted(scores.items(), key=lambda kv: kv[1][0])
-    first_name,  (first_rmse,  _) = sorted_models[0]
-    second_name, (second_rmse, _) = sorted_models[1]
-    gap_pct = (second_rmse - first_rmse) / first_rmse * 100
 
-    # Only blend when: (1) gap is genuinely tight, (2) the models aren't both terrible
-    # noise_ratio computed here early to gate blending
-    noise_ratio = first_rmse / profile.target_std if profile.target_std > 0 else 1.0
+# Compares the tuned candidate models using a fresh CV split
+def compare_tuned_candidates(tuned_candidates, X_train, y_train, cv, verbose=True):
+    comparison = {}
+
+    if verbose:
+        print(f"\n  {'Model':<20} {'Final RMSE':>10}  {'+/- std':>8}")
+        print(f"  {'-' * 45}")
+
+    for name, tuned in tuned_candidates.items():
+        scores = cross_val_score(
+            tuned["best_estimator"],
+            X_train,
+            y_train,
+            scoring=SCORING,
+            cv=cv,
+        )
+        rmse = float(-scores.mean())
+        std = float(scores.std())
+        comparison[name] = {
+            "cv_rmse": rmse,
+            "cv_std": std,
+        }
+
+        if verbose:
+            print(f"  {name:<20} {rmse:>10.3f}  {std:>8.3f}")
+
+    best_name = min(comparison, key=lambda model_name: comparison[model_name]["cv_rmse"])
+    return best_name, comparison[best_name], comparison
+
+
+# Select the best model for a stock
+def select_model(profile, X_train, y_train, verbose=True):
+    tuned_candidates = tune_all_candidates(profile, X_train, y_train, verbose=verbose)
+    comparison_cv = _build_cv(profile.n_train, random_state=99)
+    best_name, best_scores, comparison = compare_tuned_candidates(
+        tuned_candidates,
+        X_train,
+        y_train,
+        comparison_cv,
+        verbose=verbose,
+    )
+
+    final_model = clone(tuned_candidates[best_name]["best_estimator"])
+    final_model.fit(X_train, y_train)
+
+    best_rmse = best_scores["cv_rmse"]
+    best_std = best_scores["cv_std"]
+    noise_ratio = best_rmse / profile.target_std if profile.target_std > 0 else 1.0
+
+    # --- Blend top-2 if they're close and signal is strong ---
+    sorted_models = sorted(comparison.items(), key=lambda kv: kv[1]["cv_rmse"])
+    first_name,  first_scores  = sorted_models[0]
+    second_name, second_scores = sorted_models[1]
+    first_rmse  = first_scores["cv_rmse"]
+    second_rmse = second_scores["cv_rmse"]
+    gap_pct = (second_rmse - first_rmse) / first_rmse * 100 if first_rmse > 0 else 100
+
     use_blend = gap_pct < 1.5 and noise_ratio < 0.7
 
     if use_blend:
-        m1 = candidates[first_name]
-        m2 = candidates[second_name]
+        m1 = clone(tuned_candidates[first_name]["best_estimator"])
+        m2 = clone(tuned_candidates[second_name]["best_estimator"])
         m1.fit(X_train, y_train)
         m2.fit(X_train, y_train)
 
-        # Weight inversely by RMSE
         w1 = 1.0 / first_rmse
         w2 = 1.0 / second_rmse
         w_total = w1 + w2
         w1, w2 = w1 / w_total, w2 / w_total
-
-        blend_name = f"Blend({first_name}+{second_name})"
-        if verbose:
-            print(f"\n  Top-2 within {gap_pct:.1f}% — blending {first_name} ({w1:.2f}) + {second_name} ({w2:.2f})")
 
         class BlendModel:
             def __init__(self, m1, m2, w1, w2):
@@ -137,35 +298,48 @@ def select_model(profile, X_train, y_train, verbose=True):
             def predict(self, X):
                 return self.w1 * self.m1.predict(X) + self.w2 * self.m2.predict(X)
             def fit(self, X, y):
-                return self  # already fitted
+                return self
 
-        winner = BlendModel(m1, m2, w1, w2)
-        best_name = blend_name
-        best_rmse = first_rmse  # conservative: report the better of the two
+        final_model = BlendModel(m1, m2, w1, w2)
+        best_name = f"Blend({first_name}+{second_name})"
+        best_rmse = first_rmse  # conservative
 
         if verbose:
+            print(f"\n  Top-2 within {gap_pct:.1f}% — blending {first_name} ({w1:.2f}) + {second_name} ({w2:.2f})")
             print(f"  Winner: {best_name}  (RMSE≈{best_rmse:.3f})")
     else:
-        winner = candidates[best_name]
-        winner.fit(X_train, y_train)
         if verbose:
-            print(f"\n  Winner: {best_name}  (RMSE={best_rmse:.3f} ±{best_std:.3f})")
+            print(f"\n  Winner: {best_name}  (RMSE={best_rmse:.3f} +/- {best_std:.3f})")
 
-    # --- NEW: compute noise ratio for spread decisions ---
-    noise_ratio = best_rmse / profile.target_std if profile.target_std > 0 else 1.0
-    profile.noise_ratio = round(noise_ratio, 4)
-
-    # Flag no-quote only when model explains almost nothing
+    profile.noise_ratio = noise_ratio
     profile.no_quote = noise_ratio > 0.98
 
+    tuned_summary = {}
+    for name, tuned in tuned_candidates.items():
+        tuned_summary[name] = {
+            "best_params": tuned["best_params"],
+            "tune_rmse": tuned["tune_rmse"],
+            "tune_std": tuned["tune_std"],
+            "final_rmse": comparison[name]["cv_rmse"],
+            "final_std": comparison[name]["cv_std"],
+        }
+
+    # When blended, best_params comes from the top model
+    if use_blend:
+        best_params = tuned_candidates[first_name]["best_params"]
+    else:
+        best_params = tuned_candidates[best_name]["best_params"]
+
     return {
-        "name":       best_name,
-        "model":      winner,
-        "cv_rmse":    round(best_rmse, 4),
-        "cv_std":     round(best_std, 4),
-        "all_scores": {k: round(v[0], 4) for k, v in scores.items()},
-        "noise_ratio": round(noise_ratio, 4),
-        "blended":    use_blend,
+        "name": best_name,
+        "model": final_model,
+        "best_params": best_params,
+        "cv_rmse": best_rmse,
+        "cv_std": best_std,
+        "all_scores": {name: scores["cv_rmse"] for name, scores in comparison.items()},
+        "tuned_models": tuned_summary,
+        "noise_ratio": noise_ratio,
+        "blended": use_blend,
     }
 
 
@@ -174,16 +348,14 @@ if __name__ == "__main__":
     from pathlib import Path
     import sys
     sys.path.append(str(Path(__file__).parent))
-    from pipeline.data_check import profile_dataset
-    
-    sys.stdout = open("output.log", "w")
+    from data_check import profile_dataset
 
     DATA_DIR = Path(__file__).parent.parent / "hackathon_data"
 
     for i in range(1, 10):
-        print(f"\n{'='*45}")
+        print(f"\n{'='*50}")
         print(f"  STOCK {i}")
-        print(f"{'='*45}")
+        print(f"{'='*50}")
         train = pd.read_csv(DATA_DIR / f"stock_{i}_train.csv")
         test  = pd.read_csv(DATA_DIR / f"stock_{i}_test.csv")
         X = train.drop("target", axis=1)
@@ -191,7 +363,6 @@ if __name__ == "__main__":
         profile = profile_dataset(train, test)
         result  = select_model(profile, X, y)
         pred    = result["model"].predict(test)[0]
-        print(f"  Prediction: {pred:.2f}")
-        print(f"  Noise ratio: {result['noise_ratio']:.2f}  |  No-quote: {profile.no_quote}")
-    
-    sys.stdout.close()
+        print(f"  Prediction:   {pred:.2f}")
+        print(f"  Noise ratio:  {result['noise_ratio']:.4f}")
+        print(f"  Best params:  {result['best_params']}")
