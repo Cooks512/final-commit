@@ -333,5 +333,5 @@ scipy
 | **overfit_ratio** | train_rmse / cv_rmse | 1.0 = no overfit, < 0.85 = significant overfit |
 | **aggression** | 0–1 scale | Higher = tighter spread = more likely to become MM |
 | **edge_zscore** | edge / cv_rmse | How many standard errors of predicted profit you have |
-| **ood_spread_multiplier** | 1.0–2.5 | Spread widening factor when test point is far from training data |
+| **ood_spread_multiplier** | 1.0–2.5 | Spread widening factor when test point is far from training data |  
 fix attribution
