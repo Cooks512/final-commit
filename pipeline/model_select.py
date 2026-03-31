@@ -13,6 +13,8 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import PolynomialFeatures, StandardScaler
 from sklearn.svm import SVR
 
+from sklearn.utils import resample
+
 warnings.filterwarnings("ignore")
 
 SCORING = "neg_root_mean_squared_error"
@@ -253,7 +255,143 @@ def compare_tuned_candidates(tuned_candidates, X_train, y_train, cv, verbose=Tru
 
 
 # Select the best model for a stock
+#def select_model(profile, X_train, y_train, verbose=True):
+#
+#    tuned_candidates = tune_all_candidates(profile, X_train, y_train, verbose=verbose)
+#    comparison_cv = _build_cv(profile.n_train, random_state=99)
+#    best_name, best_scores, comparison = compare_tuned_candidates(
+#        tuned_candidates,
+#        X_train,
+#        y_train,
+#        comparison_cv,
+#        verbose=verbose,
+#    )
+#
+#    final_model = clone(tuned_candidates[best_name]["best_estimator"])
+#    final_model.fit(X_train, y_train)
+#
+#    best_rmse = best_scores["cv_rmse"]
+#    best_std = best_scores["cv_std"]
+#    noise_ratio = best_rmse / profile.target_std if profile.target_std > 0 else 1.0
+#
+#    # --- Blend top-2 if they're close and signal is strong ---
+#    sorted_models = sorted(comparison.items(), key=lambda kv: kv[1]["cv_rmse"])
+#    first_name,  first_scores  = sorted_models[0]
+#    second_name, second_scores = sorted_models[1]
+#    first_rmse  = first_scores["cv_rmse"]
+#    second_rmse = second_scores["cv_rmse"]
+#    gap_pct = (second_rmse - first_rmse) / first_rmse * 100 if first_rmse > 0 else 100
+#
+#    use_blend = gap_pct < 1.5 and noise_ratio < 0.7
+#
+#    if use_blend:
+#        m1 = clone(tuned_candidates[first_name]["best_estimator"])
+#        m2 = clone(tuned_candidates[second_name]["best_estimator"])
+#        m1.fit(X_train, y_train)
+#        m2.fit(X_train, y_train)
+#
+#        w1 = 1.0 / first_rmse
+#        w2 = 1.0 / second_rmse
+#        w_total = w1 + w2
+#        w1, w2 = w1 / w_total, w2 / w_total
+#
+#        class BlendModel:
+#            def __init__(self, m1, m2, w1, w2):
+#                self.m1, self.m2, self.w1, self.w2 = m1, m2, w1, w2
+#            def predict(self, X):
+#                return self.w1 * self.m1.predict(X) + self.w2 * self.m2.predict(X)
+#            def fit(self, X, y):
+#                return self
+#
+#        final_model = BlendModel(m1, m2, w1, w2)
+#        best_name = f"Blend({first_name}+{second_name})"
+#        best_rmse = first_rmse  # conservative
+#
+#        if verbose:
+#            print(f"\n  Top-2 within {gap_pct:.1f}% — blending {first_name} ({w1:.2f}) + {second_name} ({w2:.2f})")
+#            print(f"  Winner: {best_name}  (RMSE≈{best_rmse:.3f})")
+#    else:
+#        if verbose:
+#            print(f"\n  Winner: {best_name}  (RMSE={best_rmse:.3f} +/- {best_std:.3f})")
+#
+#    profile.noise_ratio = noise_ratio
+#    profile.no_quote = noise_ratio > 0.98
+#
+#    tuned_summary = {}
+#    for name, tuned in tuned_candidates.items():
+#        tuned_summary[name] = {
+#            "best_params": tuned["best_params"],
+#            "tune_rmse": tuned["tune_rmse"],
+#            "tune_std": tuned["tune_std"],
+#            "final_rmse": comparison[name]["cv_rmse"],
+#            "final_std": comparison[name]["cv_std"],
+#        }
+#
+#    # When blended, best_params comes from the top model
+#    if use_blend:
+#        best_params = tuned_candidates[first_name]["best_params"]
+#    else:
+#        best_params = tuned_candidates[best_name]["best_params"]
+#
+#    return {
+#        "name": best_name,
+#        "model": final_model,
+#        "best_params": best_params,
+#        "cv_rmse": best_rmse,
+#        "cv_std": best_std,
+#        "all_scores": {name: scores["cv_rmse"] for name, scores in comparison.items()},
+#        "tuned_models": tuned_summary,
+#        "noise_ratio": noise_ratio,
+#        "blended": use_blend,
+#    }
+#
+
 def select_model(profile, X_train, y_train, verbose=True):
+
+    # Augment only small datasets
+    if profile.n_train < 200:
+        n_bootstrap = 8 if profile.n_train < 50 else 4
+
+        X_aug_parts = [X_train.copy()]
+        y_aug_parts = [y_train.copy()]
+
+        y_noise_std = max(profile.target_std * 0.02, 1e-8)
+
+        for _ in range(n_bootstrap):
+            X_boot, y_boot = resample(X_train, y_train, replace=True, random_state=None)
+
+            X_boot = X_boot.copy()
+            y_boot = y_boot.copy()
+
+            x_noise = np.random.normal(0, 0.01, size=X_boot.shape)
+            y_noise = np.random.normal(0, y_noise_std, size=len(y_boot))
+
+            if isinstance(X_boot, pd.DataFrame):
+                X_boot = X_boot + x_noise
+            else:
+                X_boot = X_boot + x_noise
+
+            if isinstance(y_boot, pd.Series):
+                y_boot = y_boot + y_noise
+            else:
+                y_boot = y_boot + y_noise
+
+            X_aug_parts.append(X_boot)
+            y_aug_parts.append(y_boot)
+
+        if isinstance(X_train, pd.DataFrame):
+            X_train = pd.concat(X_aug_parts, axis=0, ignore_index=True)
+        else:
+            X_train = np.vstack(X_aug_parts)
+
+        if isinstance(y_train, pd.Series):
+            y_train = pd.concat(y_aug_parts, axis=0, ignore_index=True)
+        else:
+            y_train = np.hstack(y_aug_parts)
+
+        if verbose:
+            print(f"\n  Augmented training rows: {profile.n_train} -> {len(y_train)}")
+
     tuned_candidates = tune_all_candidates(profile, X_train, y_train, verbose=verbose)
     comparison_cv = _build_cv(profile.n_train, random_state=99)
     best_name, best_scores, comparison = compare_tuned_candidates(
@@ -271,7 +409,6 @@ def select_model(profile, X_train, y_train, verbose=True):
     best_std = best_scores["cv_std"]
     noise_ratio = best_rmse / profile.target_std if profile.target_std > 0 else 1.0
 
-    # --- Blend top-2 if they're close and signal is strong ---
     sorted_models = sorted(comparison.items(), key=lambda kv: kv[1]["cv_rmse"])
     first_name,  first_scores  = sorted_models[0]
     second_name, second_scores = sorted_models[1]
@@ -302,7 +439,7 @@ def select_model(profile, X_train, y_train, verbose=True):
 
         final_model = BlendModel(m1, m2, w1, w2)
         best_name = f"Blend({first_name}+{second_name})"
-        best_rmse = first_rmse  # conservative
+        best_rmse = first_rmse
 
         if verbose:
             print(f"\n  Top-2 within {gap_pct:.1f}% — blending {first_name} ({w1:.2f}) + {second_name} ({w2:.2f})")
@@ -324,7 +461,6 @@ def select_model(profile, X_train, y_train, verbose=True):
             "final_std": comparison[name]["cv_std"],
         }
 
-    # When blended, best_params comes from the top model
     if use_blend:
         best_params = tuned_candidates[first_name]["best_params"]
     else:
@@ -353,9 +489,11 @@ if __name__ == "__main__":
     DATA_DIR = Path(__file__).parent.parent / "hackathon_data"
 
     for i in range(1, 10):
+
         print(f"\n{'='*50}")
         print(f"  STOCK {i}")
         print(f"{'='*50}")
+
         train = pd.read_csv(DATA_DIR / f"stock_{i}_train.csv")
         test  = pd.read_csv(DATA_DIR / f"stock_{i}_test.csv")
         X = train.drop("target", axis=1)
@@ -363,6 +501,7 @@ if __name__ == "__main__":
         profile = profile_dataset(train, test)
         result  = select_model(profile, X, y)
         pred    = result["model"].predict(test)[0]
+
         print(f"  Prediction:   {pred:.2f}")
         print(f"  Noise ratio:  {result['noise_ratio']:.4f}")
         print(f"  Best params:  {result['best_params']}")
