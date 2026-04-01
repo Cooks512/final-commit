@@ -346,51 +346,41 @@ def compare_tuned_candidates(tuned_candidates, X_train, y_train, cv, verbose=Tru
 #    }
 #
 
+def augment_training_data(X_train, y_train, profile):
+
+    # Augment only the small datasets, in our case stocks 3, 6, and 9
+    if len(X_train) >= 200:
+        return X_train, y_train
+
+    n_bootstrap = 8 if len(X_train) < 50 else 4
+    y_noise_std = max(profile.target_std * 0.02, 1e-8)
+
+    X_aug_parts = [X_train.copy()]
+    y_aug_parts = [y_train.copy()]
+        
+    for _ in range(n_bootstrap):
+
+        # duplicate data points
+        X_boot, y_boot = resample(X_train, y_train, replace=True, random_state=None)
+        
+        # add random noise to duplicate points
+        X_boot = X_boot + np.random.normal(0, 0.01, size=X_boot.shape)
+        y_boot = y_boot + np.random.normal(0, y_noise_std, size=len(y_boot))
+            
+        X_aug_parts.append(X_boot)
+        y_aug_parts.append(y_boot)
+
+    X_out = pd.concat(X_aug_parts, axis=0, ignore_index=True)
+    y_out = pd.concat(y_aug_parts, axis=0, ignore_index=True)
+
+    return X_out, y_out
+
 def select_model(profile, X_train, y_train, verbose=True):
 
-    # Augment only small datasets
-    if profile.n_train < 200:
-        n_bootstrap = 8 if profile.n_train < 50 else 4
+    X_train, y_train = augment_training_data(X_train, y_train, profile)
 
-        X_aug_parts = [X_train.copy()]
-        y_aug_parts = [y_train.copy()]
-
-        y_noise_std = max(profile.target_std * 0.02, 1e-8)
-
-        for _ in range(n_bootstrap):
-            X_boot, y_boot = resample(X_train, y_train, replace=True, random_state=None)
-
-            X_boot = X_boot.copy()
-            y_boot = y_boot.copy()
-
-            x_noise = np.random.normal(0, 0.01, size=X_boot.shape)
-            y_noise = np.random.normal(0, y_noise_std, size=len(y_boot))
-
-            if isinstance(X_boot, pd.DataFrame):
-                X_boot = X_boot + x_noise
-            else:
-                X_boot = X_boot + x_noise
-
-            if isinstance(y_boot, pd.Series):
-                y_boot = y_boot + y_noise
-            else:
-                y_boot = y_boot + y_noise
-
-            X_aug_parts.append(X_boot)
-            y_aug_parts.append(y_boot)
-
-        if isinstance(X_train, pd.DataFrame):
-            X_train = pd.concat(X_aug_parts, axis=0, ignore_index=True)
-        else:
-            X_train = np.vstack(X_aug_parts)
-
-        if isinstance(y_train, pd.Series):
-            y_train = pd.concat(y_aug_parts, axis=0, ignore_index=True)
-        else:
-            y_train = np.hstack(y_aug_parts)
-
-        if verbose:
-            print(f"\n  Augmented training rows: {profile.n_train} -> {len(y_train)}")
+    if verbose:
+        print(f"\n  Augmented training rows: {profile.n_train} -> {len(y_train)}")
 
     tuned_candidates = tune_all_candidates(profile, X_train, y_train, verbose=verbose)
     comparison_cv = _build_cv(profile.n_train, random_state=99)
