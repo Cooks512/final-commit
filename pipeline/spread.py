@@ -19,17 +19,15 @@ Three tiers based on proven performance:
 import numpy as np
 
 
-def compute_spread(prediction, cv_rmse, profile, overfit_ratio=1.0,
-                   aggression=None, capital=100_000, round_num=1):
+def compute_spread(prediction, cv_rmse, profile, overfit_ratio=1.0, aggression=None, capital=100_000, round_num=1):
     """
     Compute bid/ask with three-tier game-theory-aware spread sizing.
     """
 
     noise = profile.noise_ratio
 
-    # ──────────────────────────────────────────────────────────
+   
     # 1. DECIDE TIER
-    # ──────────────────────────────────────────────────────────
     if aggression is not None:
         # Manual override — skip auto tier
         tier = "MANUAL"
@@ -42,9 +40,8 @@ def compute_spread(prediction, cv_rmse, profile, overfit_ratio=1.0,
     else:
         tier = "SURVIVE"
 
-    # ──────────────────────────────────────────────────────────
+   
     # 2. SET AGGRESSION PER TIER
-    # ──────────────────────────────────────────────────────────
     if aggression is None:
         if tier == "ATTACK":
             aggression = 0.7       # tight — go for MM seat
@@ -56,9 +53,8 @@ def compute_spread(prediction, cv_rmse, profile, overfit_ratio=1.0,
             else:
                 aggression = 0.03  # very wide — just participating
 
-    # ──────────────────────────────────────────────────────────
+  
     # 3. COMPUTE HALF-SPREAD
-    # ──────────────────────────────────────────────────────────
     multiplier  = 2.0 - 1.5 * aggression
     half_spread = cv_rmse * multiplier
 
@@ -69,9 +65,8 @@ def compute_spread(prediction, cv_rmse, profile, overfit_ratio=1.0,
     # OOD penalty
     half_spread *= profile.ood_spread_multiplier
 
-    # ──────────────────────────────────────────────────────────
+   
     # 4. BOUNDS PER TIER
-    # ──────────────────────────────────────────────────────────
     if tier == "ATTACK":
         min_half = cv_rmse * 1.5
         max_half = cv_rmse * 3.0
@@ -86,16 +81,12 @@ def compute_spread(prediction, cv_rmse, profile, overfit_ratio=1.0,
 
     half_spread = float(np.clip(half_spread, min_half, max_half))
 
-    # ──────────────────────────────────────────────────────────
     # 5. MEAN-ANCHOR low-signal predictions
-    # ──────────────────────────────────────────────────────────
     if noise > 0.8:
         mean_weight = min((noise - 0.8) / 0.2, 0.6)
         prediction = prediction * (1 - mean_weight) + profile.target_mean * mean_weight
 
-    # ──────────────────────────────────────────────────────────
     # 6. ASYMMETRIC SPREAD (mild mean-reversion bias)
-    # ──────────────────────────────────────────────────────────
     if profile.target_std > 0:
         deviation = (prediction - profile.target_mean) / profile.target_std
         asym = np.clip(deviation * 0.1, -0.2, 0.2)
