@@ -93,6 +93,8 @@ def load_trained_stock_model(model_path):
 def _print_training_summary(stock_number, profile, selector_result, artifact_path, test_prediction):
     all_scores = _sorted_scores(selector_result["all_scores"])
     mixing_scores = _sorted_scores(selector_result["mixing_scores"])
+    tuned_models = selector_result.get("tuned_models", {})
+    ensemble_models = selector_result.get("ensemble_models", {})
 
     print("\n" + "=" * 90)
     print(f"  STOCK {stock_number} TRAINING SUMMARY")
@@ -123,12 +125,30 @@ def _print_training_summary(stock_number, profile, selector_result, artifact_pat
 
     print("\n  Top candidate models:")
     for name, rmse in all_scores[:5]:
-        print(f"    {name:<24} RMSE={rmse:.4f}")
+        details = tuned_models.get(name, {})
+        train_rmse = details.get("train_rmse")
+        overfit_ratio = details.get("overfit_ratio")
+        if train_rmse is not None and overfit_ratio is not None:
+            print(
+                f"    {name:<24} RMSE={rmse:.4f}  |  "
+                f"Train={train_rmse:.4f}  |  O/F={overfit_ratio:.4f}"
+            )
+        else:
+            print(f"    {name:<24} RMSE={rmse:.4f}")
 
     if mixing_scores:
         print("\n  Top mixed models:")
         for name, rmse in mixing_scores[:5]:
-            print(f"    {name:<24} RMSE={rmse:.4f}")
+            details = ensemble_models.get(name, {})
+            train_rmse = details.get("train_rmse")
+            overfit_ratio = details.get("overfit_ratio")
+            if train_rmse is not None and overfit_ratio is not None:
+                print(
+                    f"    {name:<24} RMSE={rmse:.4f}  |  "
+                    f"Train={train_rmse:.4f}  |  O/F={overfit_ratio:.4f}"
+                )
+            else:
+                print(f"    {name:<24} RMSE={rmse:.4f}")
 
     print(f"\n  Test prediction(s): {test_prediction}")
     print(f"  Saved model artifact: {artifact_path}")

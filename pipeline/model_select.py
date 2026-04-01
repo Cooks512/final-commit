@@ -117,8 +117,11 @@ class CandidateResult:
     best_params: dict[str, Any]
     tune_rmse: float
     tune_std: float
+    train_rmse: float = 0.0
     cv_rmse: float = 0.0
     cv_std: float = 0.0
+    overfit_ratio: float = 1.0
+    overfit_flag: bool = False
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -126,8 +129,11 @@ class CandidateResult:
             "best_params": self.best_params,
             "tune_rmse": self.tune_rmse,
             "tune_std": self.tune_std,
+            "train_rmse": self.train_rmse,
             "final_rmse": self.cv_rmse,
             "final_std": self.cv_std,
+            "overfit_ratio": self.overfit_ratio,
+            "overfit_flag": self.overfit_flag,
         }
 
 
@@ -140,6 +146,9 @@ class EnsembleResult:
     cv_rmse: float
     cv_std: float
     weights: list[float] | None = None
+    train_rmse: float = 0.0
+    overfit_ratio: float = 1.0
+    overfit_flag: bool = False
 
 
 def _resolve_stock_number(stock_number):
@@ -641,16 +650,31 @@ class StockModelSelector:
         if self.verbose:
             print(message)
 
+    def _compute_train_metrics(self, estimator, cv_rmse: float, fit_before_predict: bool = False):
+        if fit_before_predict:
+            estimator.fit(self.X_train, self.y_train)
+
+        predictions = np.asarray(estimator.predict(self.X_train), dtype=float).reshape(-1)
+        y_true = np.asarray(self.y_train, dtype=float).reshape(-1)
+        train_rmse = float(np.sqrt(np.mean((y_true - predictions) ** 2)))
+        overfit_ratio = train_rmse / cv_rmse if cv_rmse > 0 else 1.0
+        overfit_flag = overfit_ratio < 0.85
+        return train_rmse, overfit_ratio, overfit_flag
+
     def _tune_candidates(self) -> dict[str, CandidateResult]:
         tuning_cv = self.strategy.tuning_cv.build(self.random_state)
-        self._log(f"\n  {'Model':<20} {'Tune RMSE':>10}  {'+/- std':>8}")
-        self._log(f"  {'-' * 44}")
+        self._log(f"\n  {'Model':<20} {'Tune RMSE':>10}  {'+/- std':>8}  {'Train':>8}  {'O/F':>6}")
+        self._log(f"  {'-' * 72}")
 
         tuned_results = {}
         for spec in self.strategy.candidates:
             result = self._tune_candidate(spec, tuning_cv)
             tuned_results[result.name] = result
-            self._log(f"  {result.name:<20} {result.tune_rmse:>10.3f}  {result.tune_std:>8.3f}")
+            tune_overfit_ratio = result.train_rmse / result.tune_rmse if result.tune_rmse > 0 else 1.0
+            self._log(
+                f"  {result.name:<20} {result.tune_rmse:>10.3f}  {result.tune_std:>8.3f}  "
+                f"{result.train_rmse:>8.3f}  {tune_overfit_ratio:>6.3f}"
+            )
         return tuned_results
 
     def _tune_candidate(self, spec: CandidateSpec, cv) -> CandidateResult:
@@ -667,6 +691,7 @@ class StockModelSelector:
         best_index = search.best_index_
         best_rmse = float(-search.best_score_)
         best_std = float(search.cv_results_["std_test_score"][best_index])
+        train_rmse, _, _ = self._compute_train_metrics(search.best_estimator_, best_rmse)
 
         return CandidateResult(
             name=spec.name,
@@ -675,14 +700,15 @@ class StockModelSelector:
             best_params=search.best_params_,
             tune_rmse=best_rmse,
             tune_std=best_std,
+            train_rmse=train_rmse,
         )
 
     def _compare_candidates(self, tuned_results: dict[str, CandidateResult]):
         comparison_cv = self.strategy.comparison_cv.build(self.random_state + 1)
         comparison = {}
 
-        self._log(f"\n  {'Model':<20} {'Final RMSE':>10}  {'+/- std':>8}")
-        self._log(f"  {'-' * 45}")
+        self._log(f"\n  {'Model':<20} {'Final RMSE':>10}  {'+/- std':>8}  {'Train':>8}  {'O/F':>6}")
+        self._log(f"  {'-' * 73}")
 
         for result in tuned_results.values():
             scores = cross_val_score(
@@ -694,11 +720,21 @@ class StockModelSelector:
             )
             result.cv_rmse = float(-scores.mean())
             result.cv_std = float(scores.std())
+            result.train_rmse, result.overfit_ratio, result.overfit_flag = self._compute_train_metrics(
+                result.best_estimator,
+                result.cv_rmse,
+            )
             comparison[result.name] = {
                 "cv_rmse": result.cv_rmse,
                 "cv_std": result.cv_std,
+                "train_rmse": result.train_rmse,
+                "overfit_ratio": result.overfit_ratio,
+                "overfit_flag": result.overfit_flag,
             }
-            self._log(f"  {result.name:<20} {result.cv_rmse:>10.3f}  {result.cv_std:>8.3f}")
+            self._log(
+                f"  {result.name:<20} {result.cv_rmse:>10.3f}  {result.cv_std:>8.3f}  "
+                f"{result.train_rmse:>8.3f}  {result.overfit_ratio:>6.3f}"
+            )
 
         best_name, tie_tolerance = _select_best_with_tiebreak(comparison)
         comparison[best_name]["tie_tolerance"] = tie_tolerance
@@ -728,8 +764,8 @@ class StockModelSelector:
             random_state=self.random_state + 2,
         )
 
-        self._log(f"\n  {'Ensemble':<36} {'RMSE':>10}  {'+/- std':>8}")
-        self._log(f"  {'-' * 57}")
+        self._log(f"\n  {'Ensemble':<36} {'RMSE':>10}  {'+/- std':>8}  {'Train':>8}  {'O/F':>6}")
+        self._log(f"  {'-' * 85}")
 
         candidate_sets = []
         max_top = min(mix_plan.top_k, len(ordered_candidates))
@@ -776,8 +812,16 @@ class StockModelSelector:
                 )
                 ensemble.cv_rmse = float(-scores.mean())
                 ensemble.cv_std = float(scores.std())
+                ensemble.train_rmse, ensemble.overfit_ratio, ensemble.overfit_flag = self._compute_train_metrics(
+                    ensemble.estimator,
+                    ensemble.cv_rmse,
+                    fit_before_predict=True,
+                )
                 ensemble_results[ensemble.name] = ensemble
-                self._log(f"  {ensemble.name:<36} {ensemble.cv_rmse:>10.3f}  {ensemble.cv_std:>8.3f}")
+                self._log(
+                    f"  {ensemble.name:<36} {ensemble.cv_rmse:>10.3f}  {ensemble.cv_std:>8.3f}  "
+                    f"{ensemble.train_rmse:>8.3f}  {ensemble.overfit_ratio:>6.3f}"
+                )
 
         if not ensemble_results:
             return None, ensemble_results
@@ -898,6 +942,19 @@ class StockModelSelector:
             "all_scores": {candidate.name: candidate.cv_rmse for candidate in ordered_candidates},
             "mixing_scores": {name: result.cv_rmse for name, result in ensemble_results.items()},
             "tuned_models": {name: result.summary() for name, result in tuned_results.items()},
+            "ensemble_models": {
+                name: {
+                    "method": result.method,
+                    "members": result.members,
+                    "weights": result.weights,
+                    "final_rmse": result.cv_rmse,
+                    "final_std": result.cv_std,
+                    "train_rmse": result.train_rmse,
+                    "overfit_ratio": result.overfit_ratio,
+                    "overfit_flag": result.overfit_flag,
+                }
+                for name, result in ensemble_results.items()
+            },
             "noise_ratio": noise_ratio,
             "blended": mixing_used,
             "mixing_used": mixing_used,
