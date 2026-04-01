@@ -1,5 +1,6 @@
 """
-Helpers for loading and using saved stock-model artifacts.
+Helpers for loading saved stock models, quoting a spread, and making a trade
+decision for a single round.
 """
 
 import pickle
@@ -10,8 +11,10 @@ import pandas as pd
 
 try:
     from .spread import compute_spread as _compute_quote_spread
+    from .trading_decide import decide_trade as _decide_trade
 except ImportError:
     from spread import compute_spread as _compute_quote_spread
+    from trading_decide import decide_trade as _decide_trade
 
 
 DEFAULT_DATA_DIR = Path(__file__).parent.parent / "hackathon_data"
@@ -26,12 +29,15 @@ def _resolve_data_dir(data_dir=None):
     return Path(data_dir) if data_dir is not None else DEFAULT_DATA_DIR
 
 
+def _profile_object(profile_data):
+    if isinstance(profile_data, dict):
+        return SimpleNamespace(**profile_data)
+    return profile_data
+
+
 def load_saved_model(stock_number, save_dir=None, data_dir=None):
     """
     Load the saved model artifact and matching test data for one stock.
-
-    Usage:
-        loaded = load_saved_model(3)
     """
     stock_number = int(stock_number)
     save_dir = _resolve_save_dir(save_dir)
@@ -81,12 +87,6 @@ def deploy_model(saved_model, test_data):
     return model.predict(model_input)
 
 
-def _profile_object(profile_data):
-    if isinstance(profile_data, dict):
-        return SimpleNamespace(**profile_data)
-    return profile_data
-
-
 def compute_spread(loaded_model, prediction, aggression=None, capital=100_000, round_num=1):
     """
     Compute bid/ask using the saved model's profile and model summary.
@@ -108,48 +108,158 @@ def compute_spread(loaded_model, prediction, aggression=None, capital=100_000, r
         round_num=round_num,
     )
 
-def decide_role():
-    return "Market" or "Trader"
 
-
-def trader():
-    shares_to_trade = 0
-    num = max(10, shares_to_trade)
-    return "Buy" or "Sell", num
-
-
-def predict_round(number):
-    loaded = load_saved_model(number)
+def predict_round(stock_number, save_dir=None, data_dir=None, aggression=None, capital=100_000, round_num=1):
+    """
+    Load one stock, predict its test price, and compute our quote.
+    """
+    loaded = load_saved_model(stock_number, save_dir=save_dir, data_dir=data_dir)
     prediction_values = deploy_model(loaded, loaded["test_data"])
     prediction = float(prediction_values[0])
-    quotes = compute_spread(loaded, prediction)
+    quote = compute_spread(
+        loaded,
+        prediction,
+        aggression=aggression,
+        capital=capital,
+        round_num=round_num,
+    )
 
     return {
-        "prediction": float(quotes["prediction"]),
-        "bid": float(quotes["bid"]),
-        "ask": float(quotes["ask"]),
-        "spread": float(quotes["spread"]),
+        "stock_number": int(stock_number),
+        "model_name": loaded.get("model_summary", {}).get("name"),
+        "raw_prediction": prediction,
+        "prediction": float(quote["prediction"]),
+        "bid": float(quote["bid"]),
+        "ask": float(quote["ask"]),
+        "spread": float(quote["spread"]),
+        "quote": {
+            "raw_prediction": prediction,
+            "prediction": float(quote["prediction"]),
+            "prediction_raw": float(quote.get("prediction_raw", prediction)),
+            "bid": float(quote["bid"]),
+            "ask": float(quote["ask"]),
+            "spread": float(quote["spread"]),
+            "aggression": float(quote["aggression"]),
+            "half_spread": float(quote["half_spread"]),
+            "role": quote["role"],
+            "bounds_tier": quote.get("bounds_tier", quote["role"]),
+        },
+        "loaded_model": loaded,
     }
 
-def trade_round(predictions, market_ask, market_bid, money):
-    pass
 
-def main():
-    money = 100_000
-    for i in range(1, 10):
-        predictions = predict_round(i)
-        role = decide_role()
-        if role == "Trader":
-            #HOW DO I GET MARKET ASK AND BID HERE?
-            market_ask = 0
-            market_bid = 0
+def trade_round(
+    loaded_model,
+    prediction,
+    mm_bid,
+    mm_ask,
+    capital,
+    round_num=1,
+    total_rounds=9,
+    starting_capital=100_000,
+    pnl_history=None,
+):
+    """
+    Decide the trade to take against the market maker in one round.
+    """
+    profile = loaded_model.get("profile", {})
+    model_summary = loaded_model.get("model_summary", {})
 
-            money = trade_round(predictions, market_ask, market_bid, money)
-        else:
-            pass
+    decision = _decide_trade(
+        prediction=float(prediction),
+        cv_rmse=float(model_summary.get("cv_rmse", 0.0)),
+        mm_bid=float(mm_bid),
+        mm_ask=float(mm_ask),
+        capital=float(capital),
+        noise_ratio=float(model_summary.get("noise_ratio", profile.get("noise_ratio", 0.5))),
+        target_mean=profile.get("target_mean"),
+        target_std=profile.get("target_std"),
+        round_num=round_num,
+        total_rounds=total_rounds,
+        starting_capital=starting_capital,
+        pnl_history=pnl_history,
+    )
 
-    return money
-        
+    money_invested = float(decision["cost"])
+    money_held = float(max(float(capital) - money_invested, 0.0))
 
-stuff = predict_round(3)
-print(stuff)
+    return {
+        "action": decision["action"],
+        "shares": int(decision["shares"]),
+        "trade_price": float(decision["trade_price"]),
+        "cost": float(decision["cost"]),
+        "edge": float(decision["edge"]),
+        "edge_zscore": float(decision["edge_zscore"]),
+        "confidence": float(decision["confidence"]),
+        "expected_pnl": float(decision["expected_pnl"]),
+        "worst_case": float(decision["worst_case"]),
+        "tier": decision["tier"],
+        "trajectory": decision["trajectory"],
+        "mm_confidence": decision["mm_confidence"],
+        "running_sortino": decision["running_sortino"],
+        "reasoning": decision["reasoning"],
+        "affordability_limited": bool(decision.get("affordability_limited", False)),
+        "market_bid": float(mm_bid),
+        "market_ask": float(mm_ask),
+        "market_mid": round((float(mm_bid) + float(mm_ask)) / 2.0, 2),
+        "market_spread": round(float(mm_ask) - float(mm_bid), 2),
+        "capital_before_trade": float(capital),
+        "money_invested": round(money_invested, 2),
+        "money_held": round(money_held, 2),
+    }
+
+
+def one_round(
+    stock_number,
+    mm_bid,
+    mm_ask,
+    capital,
+    save_dir=None,
+    data_dir=None,
+    aggression=None,
+    round_num=1,
+    total_rounds=9,
+    starting_capital=100_000,
+    pnl_history=None,
+):
+    """
+    Full round helper:
+    - load saved model
+    - predict fair value
+    - compute our bid/ask spread
+    - decide how to trade against the market maker
+    """
+    quote_result = predict_round(
+        stock_number,
+        save_dir=save_dir,
+        data_dir=data_dir,
+        aggression=aggression,
+        capital=capital,
+        round_num=round_num,
+    )
+
+    trade_result = trade_round(
+        loaded_model=quote_result["loaded_model"],
+        prediction=quote_result["prediction"],
+        mm_bid=mm_bid,
+        mm_ask=mm_ask,
+        capital=capital,
+        round_num=round_num,
+        total_rounds=total_rounds,
+        starting_capital=starting_capital,
+        pnl_history=pnl_history,
+    )
+
+    return {
+        "stock_number": int(stock_number),
+        "model_name": quote_result["model_name"],
+        "raw_prediction": quote_result["raw_prediction"],
+        "prediction": quote_result["prediction"],
+        "bid": quote_result["bid"],
+        "ask": quote_result["ask"],
+        "spread": quote_result["spread"],
+        "quote": quote_result["quote"],
+        "trade": trade_result,
+        "model_summary": quote_result["loaded_model"].get("model_summary", {}),
+        "profile": quote_result["loaded_model"].get("profile", {}),
+    }
