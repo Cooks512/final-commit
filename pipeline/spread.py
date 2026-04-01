@@ -141,7 +141,7 @@ if __name__ == "__main__":
         y     = train["target"]
 
         profile = profile_dataset(train, test)
-        result  = select_model(profile, X, y, verbose=False)
+        result  = select_model(profile, X, y, stock_number=i, verbose=False)
 
         train_pred    = result["model"].predict(X)
         train_rmse    = float(np.sqrt(np.mean((train_pred - y.values)**2)))

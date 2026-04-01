@@ -19,6 +19,8 @@ Metrics:
   - Sortino ratio estimate
 """
 
+import pickle
+from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -26,13 +28,92 @@ import sys
 import warnings
 warnings.filterwarnings("ignore")
 
+from sklearn.linear_model import LinearRegression
+
 sys.path.append(str(Path(__file__).parent))
 from data_check import profile_dataset
 from model_select import select_model
 from spread import compute_spread
 
 
-def backtest_stock(train_df, n_trials=None, seed=42, verbose=True):
+DEFAULT_DATA_DIR = Path(__file__).parent.parent / "hackathon_data"
+DEFAULT_SAVED_MODELS_DIR = Path(__file__).parent.parent / "saved_models"
+
+#  Resolve the data directory, allowing for an optional override via argument
+def _resolve_data_dir(data_dir=None):
+    return Path(data_dir) if data_dir is not None else DEFAULT_DATA_DIR
+
+# Picks which rows to test cases during evaluation.
+def _sample_holdout_indices(n_rows, n_trials=None, seed=42):
+    rng = np.random.RandomState(seed)
+    if n_trials is None:
+        n_trials = min(n_rows, 200)
+    n_trials = min(n_trials, n_rows)
+    return rng.choice(n_rows, size=n_trials, replace=False)
+
+# Build a simple linear regression baseline model for comparison in the backtest.
+def _build_linear_baseline():
+    return LinearRegression()
+
+# Summarize prediction errors into key metrics.
+def _summarize_prediction_errors(errors):
+    error_values = np.asarray(errors, dtype=float)
+    abs_errors = np.abs(error_values)
+    return {
+        "n_trials": int(len(error_values)),
+        "rmse": float(np.sqrt(np.mean(error_values ** 2))),
+        "mae": float(np.mean(abs_errors)),
+        "median_abs_error": float(np.median(abs_errors)),
+        "mean_error": float(np.mean(error_values)),
+    }
+
+# Package the model summary info (excluding the model object itself) for saving.
+def _model_package(result):
+    return {key: value for key, value in result.items() if key != "model"}
+
+# Save the trained selector model and metadata to disk for later reuse.
+def save_selector_model_artifact(
+    stock_number,
+    train_df,
+    test_df,
+    selector_result,
+    save_dir=None,
+):
+    """
+    Persist the fully trained selector model and the metadata needed to reuse it.
+    """
+    save_dir = Path(save_dir) if save_dir is not None else DEFAULT_SAVED_MODELS_DIR
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    feature_columns = train_df.drop(columns=["target"]).columns.tolist()
+    test_predictions = selector_result["model"].predict(test_df)
+    artifact = {
+        "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+        "artifact_version": 1,
+        "stock_number": int(stock_number),
+        "feature_columns": feature_columns,
+        "target_column": "target",
+        "model": selector_result["model"],
+        "model_summary": _model_package(selector_result),
+        "train_rows": int(len(train_df)),
+        "train_columns": train_df.columns.tolist(),
+        "test_rows": int(len(test_df)),
+        "test_columns": test_df.columns.tolist(),
+        "test_prediction": test_predictions.tolist(),
+    }
+
+    artifact_path = save_dir / f"stock_{int(stock_number)}_selector.pkl"
+    with open(artifact_path, "wb") as handle:
+        pickle.dump(artifact, handle)
+    return artifact_path
+
+# Load a saved selector model artifact from disk.
+def load_selector_model_artifact(model_path):
+    with open(model_path, "rb") as handle:
+        return pickle.load(handle)
+
+# Main backtest function for a single stock, using leave-one-out on training data.
+def backtest_stock(train_df, stock_number=None, n_trials=None, seed=42, verbose=True):
     """
     Run leave-one-out backtest on a single stock's training data.
     
@@ -44,15 +125,8 @@ def backtest_stock(train_df, n_trials=None, seed=42, verbose=True):
     Returns:
         dict of evaluation metrics
     """
-    rng = np.random.RandomState(seed)
     n = len(train_df)
-    
-    if n_trials is None:
-        n_trials = min(n, 200)  # cap for speed
-    
-    n_trials = min(n_trials, n)  # can't sample more than we have
-    
-    indices = rng.choice(n, size=n_trials, replace=False)
+    indices = _sample_holdout_indices(n, n_trials=n_trials, seed=seed)
     
     results = []
     
@@ -70,7 +144,13 @@ def backtest_stock(train_df, n_trials=None, seed=42, verbose=True):
             X_train = train_subset.drop(columns=["target"])
             y_train = train_subset["target"]
             
-            result = select_model(profile, X_train, y_train, verbose=False)
+            result = select_model(
+                profile,
+                X_train,
+                y_train,
+                stock_number=stock_number,
+                verbose=False,
+            )
             
             pred = float(result["model"].predict(test_features)[0])
             
@@ -210,6 +290,180 @@ def backtest_stock(train_df, n_trials=None, seed=42, verbose=True):
     
     return metrics
 
+# Main function to test the selector against a linear baseline and save the model if it wins.
+def evaluate_stock_selector_vs_linear(
+    stock_number,
+    data_dir=None,
+    n_trials=100,
+    seed=42,
+    save_dir=None,
+    verbose=True,
+):
+    """
+    Compare the selector against a plain LinearRegression baseline on one stock.
+
+    The comparison uses the same holdout rows for both models. If the selector
+    achieves lower holdout RMSE than the baseline, it is then trained on the
+    full stock train set and saved to disk together with the metadata needed
+    to reload and rerun it.
+    """
+
+    # Validate stock number
+    stock_number = int(stock_number)
+    if stock_number < 1 or stock_number > 9:
+        raise ValueError("stock_number must be between 1 and 9")
+
+    # Load data and sample holdout indices
+    data_dir = _resolve_data_dir(data_dir)
+    train_path = data_dir / f"stock_{stock_number}_train.csv"
+    test_path = data_dir / f"stock_{stock_number}_test.csv"
+    if not train_path.exists():
+        raise FileNotFoundError(f"Train file not found: {train_path}")
+    if not test_path.exists():
+        raise FileNotFoundError(f"Test file not found: {test_path}")
+    train_df = pd.read_csv(train_path)
+    test_df = pd.read_csv(test_path)
+
+    # Sample holdout indices
+    indices = _sample_holdout_indices(len(train_df), n_trials=n_trials, seed=seed)
+
+    if verbose:
+        print("\n" + "=" * 90)
+        print(f"  STOCK {stock_number} SELECTOR VS BASIC LINEAR REGRESSION")
+        print("=" * 90)
+        print(f"  Holdout trials: {len(indices)}")
+
+    # Run trials comparing selector to linear baseline on the same holdout rows
+    trial_results = []
+    failed_trials = []
+    for trial_idx, holdout_idx in enumerate(indices):
+        holdout_row = train_df.iloc[[holdout_idx]].copy()
+        train_subset = train_df.drop(index=train_df.index[holdout_idx]).reset_index(drop=True)
+
+        true_price = float(holdout_row["target"].iloc[0])
+        test_features = holdout_row.drop(columns=["target"])
+        X_train = train_subset.drop(columns=["target"])
+        y_train = train_subset["target"]
+
+        try:
+            selector_profile = profile_dataset(train_subset, test_features)
+            selector_result = select_model(
+                selector_profile,
+                X_train,
+                y_train,
+                stock_number=stock_number,
+                verbose=False,
+            )
+            selector_prediction = float(selector_result["model"].predict(test_features)[0])
+
+            baseline_model = _build_linear_baseline()
+            baseline_model.fit(X_train, y_train)
+            baseline_prediction = float(baseline_model.predict(test_features)[0])
+        except Exception as exc:
+            failed_trials.append({"trial": int(trial_idx), "error": str(exc)})
+            if verbose:
+                print(f"  Trial {trial_idx} failed: {exc}")
+            continue
+
+        selector_error = selector_prediction - true_price
+        baseline_error = baseline_prediction - true_price
+        selector_abs_error = abs(selector_error)
+        baseline_abs_error = abs(baseline_error)
+
+        if selector_abs_error + 1e-12 < baseline_abs_error:
+            winner = "selector"
+        elif baseline_abs_error + 1e-12 < selector_abs_error:
+            winner = "linear_baseline"
+        else:
+            winner = "tie"
+
+        trial_results.append({
+            "trial": int(trial_idx),
+            "true_price": true_price,
+            "selector_prediction": selector_prediction,
+            "baseline_prediction": baseline_prediction,
+            "selector_error": selector_error,
+            "baseline_error": baseline_error,
+            "selector_abs_error": selector_abs_error,
+            "baseline_abs_error": baseline_abs_error,
+            "winner": winner,
+        })
+
+    if not trial_results:
+        return {
+            "stock_number": stock_number,
+            "n_trials": 0,
+            "failed_trials": failed_trials,
+            "selector_beats_baseline": False,
+            "message": "No comparison trials completed successfully.",
+            "saved_model_path": None,
+        }
+
+    trial_df = pd.DataFrame(trial_results)
+    selector_metrics = _summarize_prediction_errors(trial_df["selector_error"].values)
+    baseline_metrics = _summarize_prediction_errors(trial_df["baseline_error"].values)
+
+    selector_wins = int((trial_df["winner"] == "selector").sum())
+    baseline_wins = int((trial_df["winner"] == "linear_baseline").sum())
+    ties = int((trial_df["winner"] == "tie").sum())
+    selector_beats_baseline = selector_metrics["rmse"] < baseline_metrics["rmse"]
+
+    saved_model_path = None
+    final_selector_result = None
+    final_selector_prediction = None
+
+    if selector_beats_baseline:
+        profile = profile_dataset(train_df, test_df)
+        X_full = train_df.drop(columns=["target"])
+        y_full = train_df["target"]
+        final_selector_result = select_model(
+            profile,
+            X_full,
+            y_full,
+            stock_number=stock_number,
+            verbose=verbose,
+        )
+        final_predictions = final_selector_result["model"].predict(test_df)
+        final_selector_prediction = final_predictions.tolist()
+        saved_model_path = save_selector_model_artifact(
+            stock_number=stock_number,
+            train_df=train_df,
+            test_df=test_df,
+            selector_result=final_selector_result,
+            save_dir=save_dir,
+        )
+
+    result = {
+        "stock_number": stock_number,
+        "n_trials": int(len(trial_df)),
+        "selector": selector_metrics,
+        "linear_baseline": baseline_metrics,
+        "selector_wins": selector_wins,
+        "baseline_wins": baseline_wins,
+        "ties": ties,
+        "selector_win_rate_pct": float(100.0 * selector_wins / len(trial_df)),
+        "rmse_improvement": float(baseline_metrics["rmse"] - selector_metrics["rmse"]),
+        "mae_improvement": float(baseline_metrics["mae"] - selector_metrics["mae"]),
+        "selector_beats_baseline": selector_beats_baseline,
+        "failed_trials": failed_trials,
+        "saved_model_path": str(saved_model_path) if saved_model_path is not None else None,
+        "final_selector_prediction": final_selector_prediction,
+        "final_selector_summary": _model_package(final_selector_result) if final_selector_result is not None else None,
+    }
+
+    if verbose:
+        print(f"\n  Selector RMSE:        {selector_metrics['rmse']:.4f}")
+        print(f"  Linear baseline RMSE: {baseline_metrics['rmse']:.4f}")
+        print(f"  Selector MAE:         {selector_metrics['mae']:.4f}")
+        print(f"  Linear baseline MAE:  {baseline_metrics['mae']:.4f}")
+        print(f"  Trial wins:           selector {selector_wins} | baseline {baseline_wins} | ties {ties}")
+        if selector_beats_baseline:
+            print(f"  Verdict: selector beat the baseline and was saved to {saved_model_path}")
+        else:
+            print("  Verdict: selector did not beat the basic linear regression baseline, so no model was saved.")
+
+    return result
+
 
 def run_full_backtest(data_dir, n_trials_per_stock=100, verbose=True):
     """Run backtest across all 9 stocks."""
@@ -234,7 +488,7 @@ def run_full_backtest(data_dir, n_trials_per_stock=100, verbose=True):
         if verbose:
             print(f"\n  Stock {i} ({len(train)} rows, {n_trials_per_stock} trials)...", end=" ", flush=True)
         
-        metrics = backtest_stock(train, n_trials=n_trials_per_stock, verbose=False)
+        metrics = backtest_stock(train, stock_number=i, n_trials=n_trials_per_stock, verbose=False)
         
         if metrics is None:
             if verbose:
@@ -293,11 +547,20 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Backtest the pipeline on training data")
     parser.add_argument("--trials", type=int, default=100, help="Holdout trials per stock (default 100)")
     parser.add_argument("--data_dir", type=str, default=None, help="Path to hackathon_data folder")
+    parser.add_argument("--stock", type=int, default=None, help="Evaluate one stock against a basic linear regression baseline")
+    parser.add_argument("--save_dir", type=str, default=None, help="Where to save winning selector models")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for evaluation sampling")
     args = parser.parse_args()
-    
-    if args.data_dir:
-        data_dir = args.data_dir
+
+    if args.stock is not None:
+        evaluate_stock_selector_vs_linear(
+            stock_number=args.stock,
+            data_dir=args.data_dir,
+            n_trials=args.trials,
+            seed=args.seed,
+            save_dir=args.save_dir,
+            verbose=True,
+        )
     else:
-        data_dir = Path(__file__).parent.parent / "hackathon_data"
-    
-    run_full_backtest(data_dir, n_trials_per_stock=args.trials)
+        data_dir = _resolve_data_dir(args.data_dir)
+        run_full_backtest(data_dir, n_trials_per_stock=args.trials)

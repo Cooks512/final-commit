@@ -6,7 +6,7 @@ import pandas as pd
 from pipeline.data_check import profile_dataset
 from pipeline.model_select import select_model
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+DATA_DIR = Path(__file__).resolve().parent.parent / "hackathon_data"
 
 
 def get_data_path(stock_number, split="train", data_dir=DATA_DIR):
@@ -52,6 +52,7 @@ def analyze_stock(stock_number, data_dir=DATA_DIR, verbose=False):
         context["profile"],
         context["X_train"],
         context["y_train"],
+        stock_number=stock_number,
         verbose=verbose,
     )
     test_prediction = float(selection["model"].predict(context["test_data"])[0])

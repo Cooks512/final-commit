@@ -295,7 +295,7 @@ if __name__ == "__main__":
         y = train["target"]
 
         profile = profile_dataset(train, test)
-        result  = select_model(profile, X, y, verbose=False)
+        result  = select_model(profile, X, y, stock_number=i, verbose=False)
         pred    = result["model"].predict(test)[0]
 
         decision = decide_trade(
@@ -331,7 +331,7 @@ if __name__ == "__main__":
             y = train["target"]
 
             profile = profile_dataset(train, test)
-            result  = select_model(profile, X, y, verbose=False)
+            result  = select_model(profile, X, y, stock_number=i, verbose=False)
             pred    = result["model"].predict(test)[0]
 
             stock_cache[i] = {
